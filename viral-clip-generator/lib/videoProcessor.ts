@@ -1,3 +1,6 @@
+import { detectFaceExpressions, getExpressionScore, loadFaceDetectionModels } from './face-detection';
+import type { FaceExpressions } from 'face-api.js';
+
 export interface VideoClip {
   blob: Blob;
   startTime: number;
@@ -14,23 +17,36 @@ function getAverageVolume(array: Uint8Array) {
   return values / length;
 }
 
-function getAverageRGB(imageData: ImageData) {
+function getFrameScore(imageData: ImageData) {
   const data = imageData.data;
-  let r = 0, g = 0, b = 0;
+  let totalBrightness = 0;
+  let totalDifference = 0;
+  
   for (let i = 0; i < data.length; i += 4) {
-    r += data[i];
-    g += data[i + 1];
-    b += data[i + 2];
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    
+    const brightness = (r + g + b) / 3;
+    totalBrightness += brightness;
+    
+    if (i < data.length - 4) {
+      const nextR = data[i + 4];
+      const nextG = data[i + 5];
+      const nextB = data[i + 6];
+      totalDifference += Math.abs(r - nextR) + Math.abs(g - nextG) + Math.abs(b - nextB);
+    }
   }
-  const count = data.length / 4;
+  
   return {
-    r: r / count,
-    g: g / count,
-    b: b / count
+    brightness: totalBrightness / (data.length / 4),
+    difference: totalDifference / (data.length / 4)
   };
 }
 
 export async function createVideoClips(file: File, clipDuration: number = 15, onProgress: (progress: number) => void): Promise<VideoClip[]> {
+  await loadFaceDetectionModels();
+
   return new Promise((resolve, reject) => {
     const video = document.createElement('video');
     video.src = URL.createObjectURL(file);
@@ -46,15 +62,14 @@ export async function createVideoClips(file: File, clipDuration: number = 15, on
         const source = audioContext.createMediaElementSource(video);
         const analyser = audioContext.createAnalyser();
         source.connect(analyser);
-        analyser.connect(audioContext.destination);
         
         const bufferLength = analyser.frequencyBinCount;
         const dataArray = new Uint8Array(bufferLength);
 
         const canvas = document.createElement('canvas');
         const ctx = canvas.getContext('2d')!;
-        canvas.width = 300;  // Reduced size for performance
-        canvas.height = 150;
+        canvas.width = 480;
+        canvas.height = 270;
 
         const stream = video.captureStream();
         const recorder = new MediaRecorder(stream, { mimeType: 'video/webm; codecs=vp9' });
@@ -64,7 +79,9 @@ export async function createVideoClips(file: File, clipDuration: number = 15, on
         let isRecording = false;
         let currentClipBlob: Blob[] = [];
         let currentClipImportance = 0;
-        let lastRGB = { r: 0, g: 0, b: 0 };
+        let previousFrameScore = { brightness: 0, difference: 0 };
+        const importanceBuffer: number[] = [];
+        const bufferSize = 5;
 
         recorder.ondataavailable = (event) => {
           if (event.data.size > 0) {
@@ -73,19 +90,21 @@ export async function createVideoClips(file: File, clipDuration: number = 15, on
         };
 
         recorder.onstop = () => {
-          const clipBlob = new Blob(currentClipBlob, { type: 'video/webm' });
-          clips.push({
-            blob: clipBlob,
-            startTime: clipStartTime,
-            duration: currentTime - clipStartTime,
-            importance: currentClipImportance
-          });
+          if (currentClipBlob.length > 0 && currentTime - clipStartTime >= 2) {
+            const clipBlob = new Blob(currentClipBlob, { type: 'video/webm' });
+            clips.push({
+              blob: clipBlob,
+              startTime: clipStartTime,
+              duration: currentTime - clipStartTime,
+              importance: currentClipImportance
+            });
+            console.log(`Clip created: Start: ${clipStartTime.toFixed(2)}, Duration: ${(currentTime - clipStartTime).toFixed(2)}, Importance: ${currentClipImportance.toFixed(2)}`);
+          }
           currentClipBlob = [];
           currentClipImportance = 0;
-          console.log(`Clip created: Start: ${clipStartTime}, Duration: ${currentTime - clipStartTime}, Importance: ${currentClipImportance}`);
         };
 
-        const processFrame = () => {
+        const processFrame = async () => {
           if (currentTime >= duration) {
             if (isRecording) {
               recorder.stop();
@@ -97,33 +116,51 @@ export async function createVideoClips(file: File, clipDuration: number = 15, on
 
           analyser.getByteFrequencyData(dataArray);
           const volume = getAverageVolume(dataArray);
+          const normalizedVolume = volume / 255;
 
           ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
           const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-          const rgb = getAverageRGB(imageData);
+          const frameScore = getFrameScore(imageData);
 
-          const colorChange = Math.abs(rgb.r - lastRGB.r) + Math.abs(rgb.g - lastRGB.g) + Math.abs(rgb.b - lastRGB.b);
-          lastRGB = rgb;
+          const expressions = await detectFaceExpressions(video);
+          const expressionScore = getExpressionScore(expressions);
 
-          const importanceScore = volume + colorChange;
+          const brightnessChange = Math.abs(frameScore.brightness - previousFrameScore.brightness) / 255;
+          const differenceChange = Math.abs(frameScore.difference - previousFrameScore.difference) / 255;
+          previousFrameScore = frameScore;
 
-          console.log(`Current time: ${currentTime.toFixed(2)}, Importance: ${importanceScore.toFixed(2)}`);
+          const importanceScore = Math.min(100, (
+            (normalizedVolume * 30) +
+            (brightnessChange * 20) +
+            (differenceChange * 20) +
+            (expressionScore * 30)
+          ));
 
-          if (importanceScore > 50 && !isRecording) {
+          importanceBuffer.push(importanceScore);
+          if (importanceBuffer.length > bufferSize) {
+            importanceBuffer.shift();
+          }
+
+          const averageImportance = importanceBuffer.reduce((a, b) => a + b, 0) / importanceBuffer.length;
+
+          console.log(`Current time: ${currentTime.toFixed(2)}, Importance: ${averageImportance.toFixed(2)}`);
+
+          if (averageImportance > 20 && !isRecording) {
             isRecording = true;
-            clipStartTime = currentTime;
+            clipStartTime = Math.max(0, currentTime - 1);
             recorder.start();
-            console.log(`Started recording at ${clipStartTime}`);
-          } else if ((importanceScore <= 50 && isRecording) || (currentTime - clipStartTime >= clipDuration)) {
+            console.log(`Started recording at ${clipStartTime.toFixed(2)}`);
+          } else if ((averageImportance <= 10 && isRecording && currentTime - clipStartTime >= 3) || 
+                     (currentTime - clipStartTime >= clipDuration)) {
             if (isRecording) {
               isRecording = false;
               recorder.stop();
-              console.log(`Stopped recording at ${currentTime}`);
+              console.log(`Stopped recording at ${currentTime.toFixed(2)}`);
             }
           }
 
           if (isRecording) {
-            currentClipImportance = Math.max(currentClipImportance, importanceScore);
+            currentClipImportance = Math.max(currentClipImportance, averageImportance);
           }
 
           currentTime += 0.1;
@@ -133,8 +170,7 @@ export async function createVideoClips(file: File, clipDuration: number = 15, on
         };
 
         video.onseeked = () => {
-          console.log(`Video seeked to ${video.currentTime}`);
-          processFrame();
+          requestAnimationFrame(processFrame);
         };
 
         video.onplay = () => {
